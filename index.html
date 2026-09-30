@@ -270,7 +270,9 @@
     'idle': '就绪',
     'saving': '正在写入文件…',
     'saved': '已保存到原文件',
+    'saved-stale': '磁盘已保存，但保存期间你又输入了新内容：新改动仍是未保存草稿，请再次保存',
     'saved-as': '已另存为新文件（原文件未改动）',
+    'saved-as-stale': '已另存为新文件，但另存期间你又输入了新内容：新改动仍是未保存草稿，请再次保存',
     'downloaded': '已下载一份 Markdown 副本；未写回任何原文件，原文件保持不变',
     'download-failed': '下载副本失败，未保存草稿仍保留在本地',
     'conflict': '保存已暂停：磁盘文件在打开后被外部修改，请选择保留哪个版本',
@@ -408,9 +410,10 @@
     var status = { code: 'idle', at: 0 };
     var saving = false;
     var conflict = null;   // {diskText,diskDigest,diskReadAt,expectedDigest}
-    var gen = 0;           // 每次保存尝试递增；迟到的异步回沿用它识别并放弃
+    var gen = 0;           // 每次保存尝试 / 会话切换递增；迟到的异步回沿用它识别并放弃
     var persistTimer = null;
     var listeners = [];
+    var writeChain = Promise.resolve();  // 同文件“比对→写入”串行化，防止并发写互相覆盖
 
     function emit(code, extra) {
       status = { code: code, at: clock() };
@@ -437,14 +440,20 @@
     function schedulePersist() {
       if (!session || !session.dirty) return;
       if (persistTimer) clearTimeout(persistTimer);
+      var target = session;
       persistTimer = setTimeout(function () {
-        persistNow().then(function () { emit('draft-kept'); })['catch'](function () {});
+        persistTimer = null;
+        if (target !== session) return;          // 会话已切换：不持久化新会话、不发事件
+        persistNow(target).then(function () {
+          if (target === session) emit('draft-kept');
+        })['catch'](function () {});
       }, debounceMs);
     }
-    /* 静默写入（调用方需要自己的状态码时不受干扰） */
-    function persistNow() {
+    /* 静默写入（调用方需要自己的状态码时不受干扰）。
+       target 可指定在途保存已脱离的旧会话，保证其草稿不丢且不碰全局状态。 */
+    function persistNow(target) {
       if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
-      var s = session;
+      var s = target || session;
       if (!s || !s.dirty) return Promise.resolve();
       s.updatedAt = clock();
       return drafts.put(toRecord(s));
@@ -453,6 +462,21 @@
     function flushBeforeUnload() {
       if (!session || !session.dirty) return Promise.resolve();
       try { return persistNow(); } catch (e) { return Promise.resolve(); }
+    }
+
+    /* 标记某会话有未保存内容并静默备份；用于保存成功后发现期间又有新输入 */
+    function keepDraft(s) {
+      s.dirty = true;
+      return persistNow(s)['catch'](function () {});
+    }
+
+    /* 切换 / 替换当前会话：作废所有在途保存尝试并复位瞬时状态。
+       迟到的回调随后会按会话身份自行静默处理，不再改状态、不弹窗。 */
+    function beginSessionChange() {
+      ++gen;
+      saving = false;
+      conflict = null;
+      if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
     }
 
     function blankLocal() {
@@ -471,7 +495,8 @@
     async function discardDraft(id) {
       await drafts['delete'](id);
       if (session && session.id === id) {
-        session = blankLocal(); conflict = null; saving = false;
+        beginSessionChange();
+        session = blankLocal();
         emit('idle');
       } else {
         emit('draft-discarded');
@@ -499,8 +524,8 @@
     }
 
     async function openHandle(handle) {
-      await persistNow();
-      conflict = null; saving = false;
+      beginSessionChange();            // 作废旧文档在途的权限请求/读取/写入
+      await persistNow();              // 落盘的仍是旧会话（beginSessionChange 未改 session）
       var text;
       try { text = await adapter.read(handle); }
       catch (e) { emit('read-failed', { message: errMsg(e) }); return; }
@@ -523,8 +548,8 @@
     }
 
     async function importText(name, text) {
+      beginSessionChange();
       await persistNow();
-      conflict = null; saving = false;
       session = {
         id: uuid(), kind: 'import', name: name || '导入的文档.md',
         draftText: text == null ? '' : String(text),
@@ -544,8 +569,24 @@
       emit('edited');
     }
 
-    /* ---------- 保存主流程 ---------- */
-    async function ensureWritable(handle, token) {
+    /* ---------- 保存主流程 ----------
+       两段式，防止“保存途中继续输入 / 切换文档”造成的丢字与状态串台：
+       阶段 1（可被新尝试作废）：申请权限 + 重新读盘，与基线摘要比对；
+            token 过期或会话已切换的回调静默退出，不弹窗、不改状态。
+       阶段 2（writeChain 串行）：锁内再读一次盘做 final check，以“此刻草稿快照”
+            写入；写成功后与最新草稿对账——期间又有输入时基线前进但草稿保留。 */
+
+    function isAlive(s, token) { return session === s && token === gen; }
+
+    /* 把“比对→写入”排进同一条链：同一文件不会有两个写并发互相覆盖 */
+    function serializeWrite(fn) {
+      var run = writeChain.then(fn, fn);
+      writeChain = run.then(function () {}, function () {});
+      return run;
+    }
+
+    async function ensureWritable(s, token) {
+      var handle = s.handle;
       var perm = 'prompt';
       try { perm = await adapter.queryPermission(handle, 'readwrite'); }
       catch (e) { perm = 'prompt'; }
@@ -553,81 +594,149 @@
         try { perm = await adapter.requestPermission(handle, 'readwrite'); }
         catch (e) { perm = 'denied'; }
       }
-      if (token !== gen) return false;           // 已被更新的保存尝试取代
+      if (!isAlive(s, token)) return false;      // 已被更新尝试取代或文档已切换
       if (perm !== 'granted') {
         saving = false;
         emit('permission-denied');
-        await persistNow();
+        await keepDraft(s);
         return false;
       }
       return true;
     }
 
-    async function readDisk(handle, token) {
-      try { return await adapter.read(handle); }
+    async function readDisk(s, token) {
+      try { return await adapter.read(s.handle); }
       catch (e) {
-        if (token === gen) {
+        if (isAlive(s, token)) {
           saving = false;
           emit('read-failed', { message: errMsg(e) });
-          await persistNow();
+          await keepDraft(s);
         }
         return null;
       }
     }
 
-    async function doWrite(s, text, token) {
-      try { await adapter.write(s.handle, text); }
+    /* 锁内二次读盘：expectDigest 取调用瞬间的基线（普通保存）或冲突中用户确认过的
+       磁盘摘要（覆盖保存）。返回 null 表示已被取代，应静默放弃；changed 表示
+       锁等待期间磁盘又被改动。同时冻结本次写入的草稿快照。 */
+    async function lockedPrepare(s, token, expectDigest) {
+      if (session !== s || token !== gen) return null;
+      var snapshot = s.draftText;
+      var diskText;
+      try { diskText = await adapter.read(s.handle); }
       catch (e) {
-        if (token !== gen) return false;
-        saving = false;
-        emit(isNotAllowed(e) ? 'permission-denied' : 'write-failed', { message: errMsg(e) });
-        await persistNow();
+        if (isAlive(s, token)) {
+          saving = false;
+          emit('read-failed', { message: errMsg(e) });
+          await keepDraft(s);
+        }
+        return null;
+      }
+      if (session !== s || token !== gen) return null;
+      var diskDigest = await sha256(diskText);
+      if (diskDigest !== expectDigest) {
+        return { changed: true, diskText: diskText, diskDigest: diskDigest };
+      }
+      return { changed: false, snapshot: snapshot, diskDigest: diskDigest };
+    }
+
+    function refreshConflict(s, prep) {
+      conflict = {
+        diskText: prep.diskText, diskDigest: prep.diskDigest,
+        diskReadAt: clock(), expectedDigest: s.baseDigest
+      };
+      saving = false;
+      emit('conflict', { diskDigest: prep.diskDigest });
+      return keepDraft(s);
+    }
+
+    /* 锁内写入并对账。会话已切换（detached）时只静默处理旧会话的草稿与基线，
+       绝不发全局状态；同会话但 token 过期（被新尝试接管）同样静默。 */
+    async function performWrite(s, snapshot, token) {
+      try { await adapter.write(s.handle, snapshot); }
+      catch (e) {
+        if (isAlive(s, token)) {
+          saving = false;
+          emit(isNotAllowed(e) ? 'permission-denied' : 'write-failed', { message: errMsg(e) });
+        }
+        await keepDraft(s);
         return false;
       }
-      if (token !== gen) return false;           // 迟到的写入结果：交由新尝试处理
-      var digest = await sha256(text);
+      var digest = await sha256(snapshot);
       s.baseDigest = digest;
       s.baseAt = clock();
-      s.dirty = false;
       s._diskDigest = digest;
       s._diskCheckedAt = clock();
-      conflict = null;
-      saving = false;
-      try { await drafts['delete'](s.id); } catch (e) {}
-      emit('saved', { digest: digest });
+      var detached = session !== s;
+      if (s.draftText === snapshot) {
+        // 写入期间没有新输入：这次保存覆盖了全部草稿
+        s.dirty = false;
+        try { await drafts['delete'](s.id); } catch (e) {}
+        if (!detached && token === gen) {
+          conflict = null;
+          saving = false;
+          emit('saved', { digest: digest });
+        }
+        return true;
+      }
+      /* 写入的只是较早的快照，之后又有输入：磁盘已前进，但后续编辑必须仍是未保存草稿 */
+      await keepDraft(s);
+      if (!detached && token === gen) {
+        conflict = null;
+        saving = false;
+        emit('saved-stale', { digest: digest });
+      }
       return true;
     }
 
-    async function saveFs(s) {
-      if (conflict) { emit('conflict-open'); return; }
-      var token = ++gen;
-      saving = true;
-      emit('saving');
+    async function runSaveAttempt(s, token) {
       try {
-        if (!await ensureWritable(s.handle, token)) return;
-        var diskText = await readDisk(s.handle, token);
+        if (!await ensureWritable(s, token)) return;
+        var diskText = await readDisk(s, token);
         if (diskText === null) return;
-        if (token !== gen) return;               // 迟到读取：直接丢弃，不弹窗也不写入
+        if (!isAlive(s, token)) return;            // 迟到读取：直接丢弃，不弹窗也不写入
         var diskDigest = await sha256(diskText);
         if (diskDigest !== s.baseDigest) {
-          // 外部修改：暂停写入，保留草稿，等用户选择
+          // 外部修改：暂停写入，保留草稿，等用户选择。文档已切换则只静默留草稿。
+          if (session !== s) { await keepDraft(s); return; }
           conflict = {
             diskText: diskText, diskDigest: diskDigest,
             diskReadAt: clock(), expectedDigest: s.baseDigest
           };
           saving = false;
           emit('conflict', { diskDigest: diskDigest });
-          await persistNow();
+          await keepDraft(s);
           return;
         }
-        await doWrite(s, s.draftText, token);
+        await serializeWrite(function () {
+          return lockedPrepare(s, token, s.baseDigest).then(function (prep) {
+            if (!prep) return;
+            if (prep.changed) {
+              // 锁等待期间磁盘又被改：刷新冲突要求再确认；已切换会话则静默保留旧草稿
+              if (session !== s) return keepDraft(s);
+              return refreshConflict(s, prep);
+            }
+            return performWrite(s, prep.snapshot, token);
+          });
+        });
       } catch (e) {
-        if (token === gen) {
+        if (isAlive(s, token)) {
           saving = false;
           emit('write-failed', { message: errMsg(e) });
-          await persistNow();
+          await keepDraft(s);
+        } else {
+          await keepDraft(s);
         }
       }
+    }
+
+    function saveFs(s) {
+      if (session !== s) return Promise.resolve();
+      if (conflict) { emit('conflict-open'); return Promise.resolve(); }
+      var token = ++gen;
+      saving = true;
+      emit('saving');
+      return runSaveAttempt(s, token);
     }
 
     function downloadDraft() {
@@ -673,28 +782,52 @@
         var token = ++gen;
         saving = true;
         emit('saving');
-        if (!await ensureWritable(s.handle, token)) return;   // 保留对话框
-        var diskText = await readDisk(s.handle, token);
-        if (diskText === null) return;
-        if (token !== gen) return;
-        var diskDigest = await sha256(diskText);
-        if (diskDigest !== c.diskDigest) {
-          // 对话框打开期间磁盘又被改了：刷新对比，要求再次确认
-          conflict = {
-            diskText: diskText, diskDigest: diskDigest,
-            diskReadAt: clock(), expectedDigest: s.baseDigest
-          };
-          saving = false;
-          emit('conflict', { diskDigest: diskDigest });
-          return;
-        }
-        conflict = null;
-        await doWrite(s, s.draftText, token);
-        return;
+        var s0 = s, confirmedDigest = c.diskDigest;
+        return runOverwrite(s0, token, confirmedDigest);
       }
       if (choice === 'saveas') {
         conflict = null;
         return saveAs();
+      }
+    }
+
+    /* 覆盖保存：锁外初查 + 写锁内二次确认（对话框期间磁盘再被改要再确认一次） */
+    async function runOverwrite(s, token, confirmedDigest) {
+      try {
+        if (!await ensureWritable(s, token)) return;   // 保留对话框
+        var diskText0 = await readDisk(s, token);
+        if (diskText0 === null) return;
+        if (!isAlive(s, token)) return;
+        var d0 = await sha256(diskText0);
+        if (d0 !== confirmedDigest) {
+          // 对话框打开后磁盘又变了：刷新对比，要求再次确认（文档已切换则静默保留旧草稿）
+          if (session !== s) { await keepDraft(s); return; }
+          conflict = {
+            diskText: diskText0, diskDigest: d0,
+            diskReadAt: clock(), expectedDigest: s.baseDigest
+          };
+          saving = false;
+          emit('conflict', { diskDigest: d0 });
+          return;
+        }
+        await serializeWrite(function () {
+          return lockedPrepare(s, token, confirmedDigest).then(function (prep) {
+            if (!prep) return;
+            if (prep.changed) {
+              if (session !== s) return keepDraft(s);
+              return refreshConflict(s, prep);
+            }
+            return performWrite(s, prep.snapshot, token);
+          });
+        });
+      } catch (e) {
+        if (isAlive(s, token)) {
+          saving = false;
+          emit('write-failed', { message: errMsg(e) });
+          await keepDraft(s);
+        } else {
+          await keepDraft(s);
+        }
       }
     }
 
@@ -708,60 +841,79 @@
       var handle;
       try { handle = await adapter.saveAs(suggestName(s.name)); }
       catch (e) {
-        if (token === gen) {
+        if (isAlive(s, token)) {
           saving = false;
           emit(isAbort(e) ? 'saveas-cancelled' : 'write-failed', { message: errMsg(e) });
         }
         return;
       }
-      if (token !== gen) return;
-      try { await adapter.write(handle, s.draftText); }
-      catch (e) {
-        if (token === gen) {
-          saving = false;
-          emit(isNotAllowed(e) ? 'permission-denied' : 'write-failed', { message: errMsg(e) });
-          await persistNow();
+      if (!isAlive(s, token)) return;
+      /* 另存为串行进同一条写链，快照在拿到锁之后冻结 */
+      await serializeWrite(async function () {
+        if (session !== s || token !== gen) return;
+        var snapshot = s.draftText;
+        try { await adapter.write(handle, snapshot); }
+        catch (e) {
+          if (isAlive(s, token)) {
+            saving = false;
+            emit(isNotAllowed(e) ? 'permission-denied' : 'write-failed', { message: errMsg(e) });
+            await keepDraft(s);
+          }
+          return;
         }
-        return;
-      }
-      if (token !== gen) return;
-      var oldId = s.id;
-      var digest = await sha256(s.draftText);
-      s.kind = 'fs';
-      s.handle = handle;
-      s.name = handle.name || s.name;
-      s.baseDigest = digest;
-      s.baseAt = clock();
-      s.dirty = false;
-      s._diskDigest = digest;
-      s._diskCheckedAt = clock();
-      try { await drafts['delete'](oldId); } catch (e) {}
-      saving = false;
-      emit('saved-as', { digest: digest, name: s.name });
+        if (session !== s || token !== gen) return;
+        var digest = await sha256(snapshot);
+        var stale = s.draftText !== snapshot;
+        var oldId = s.id;
+        s.kind = 'fs';
+        s.handle = handle;
+        s.name = handle.name || s.name;
+        s.baseDigest = digest;
+        s.baseAt = clock();
+        s._diskDigest = digest;
+        s._diskCheckedAt = clock();
+        if (!stale) {
+          s.dirty = false;
+          try { await drafts['delete'](oldId); } catch (e) {}
+          saving = false;
+          emit('saved-as', { digest: digest, name: s.name });
+        } else {
+          // 另存期间又有输入：新文件含旧快照，后续输入仍是未保存草稿
+          s.dirty = true;
+          await keepDraft(s);
+          saving = false;
+          emit('saved-as-stale', { digest: digest, name: s.name });
+        }
+      });
     }
 
     /* ---------- 草稿恢复 / 重新授权 ---------- */
     async function restore(id) {
       var rec = await drafts.get(id);
       if (!rec) { emit('draft-missing'); return null; }
-      await persistNow();
+      beginSessionChange();
+      var token = gen;
+      await persistNow();              // 保存的是切换前的旧会话（beginSessionChange 未改 session）
       session = rec;
-      conflict = null; saving = false;
-      session._diskDigest = null;
-      session._diskCheckedAt = null;
+      rec._diskDigest = null;
+      rec._diskCheckedAt = null;
       if (rec.kind === 'fs' && rec.handle) {
         var perm = 'prompt';
         try { perm = await adapter.queryPermission(rec.handle, 'readwrite'); }
         catch (e) { perm = 'prompt'; }
+        if (session !== rec || token !== gen) return rec;   // 恢复途中又切走：不再改状态
         if (perm === 'granted') {
           try {
             var text = await adapter.read(rec.handle);
             var d = await sha256(text);
-            session._diskDigest = d;
-            session._diskCheckedAt = clock();
+            if (session !== rec || token !== gen) return rec;
+            rec._diskDigest = d;
+            rec._diskCheckedAt = clock();
             emit(d !== rec.baseDigest ? 'restored-disk-newer' : 'restored-draft-current',
               { diskDigest: d });
-          } catch (e) { emit('restored-need-auth'); }
+          } catch (e) {
+            if (session === rec && token === gen) emit('restored-need-auth');
+          }
         } else {
           emit('restored-need-auth');
         }
@@ -775,20 +927,23 @@
     async function reauthorize(id) {
       var rec = id ? await drafts.get(id) : session;
       if (!rec || !rec.handle) { emit('reauth-unavailable'); return false; }
+      var token = gen;
       var perm;
       try { perm = await adapter.requestPermission(rec.handle, 'readwrite'); }
       catch (e) { perm = 'denied'; }
+      if (token !== gen) return false;                 // 期间切换了文档：不碰当前状态
       if (perm !== 'granted') { emit('permission-denied'); return false; }
       try {
         var text = await adapter.read(rec.handle);
         var d = await sha256(text);
+        if (token !== gen) return false;
         if (session && session.id === rec.id) {
           session._diskDigest = d;
           session._diskCheckedAt = clock();
         }
         emit(d !== rec.baseDigest ? 'reauth-disk-newer' : 'reauthorized', { diskDigest: d });
       } catch (e) {
-        emit('reauthorized-read-failed', { message: errMsg(e) });
+        if (token === gen) emit('reauthorized-read-failed', { message: errMsg(e) });
       }
       return true;
     }
@@ -868,12 +1023,14 @@
   var WARN_CODES = { conflict: 1, 'conflict-open': 1, 'permission-denied': 1,
     'read-failed': 1, 'write-failed': 1, 'reauth-disk-newer': 1,
     'restored-disk-newer': 1, 'restored-need-auth': 1, 'save-cancelled': 1,
-    'download-failed': 1, 'reauthorized-read-failed': 1 };
+    'download-failed': 1, 'reauthorized-read-failed': 1,
+    'saved-stale': 1, 'saved-as-stale': 1 };
   var ERR_CODES = { 'permission-denied': 1, 'read-failed': 1, 'write-failed': 1,
     'download-failed': 1, 'reauthorized-read-failed': 1 };
   var OK_CODES = { saved: 1, 'saved-as': 1, downloaded: 1, 'loaded-disk': 1, reauthorized: 1 };
   var TOAST_CODES = { saved: 1, 'saved-as': 1, downloaded: 1, 'permission-denied': 1,
-    'read-failed': 1, 'write-failed': 1, 'reauth-disk-newer': 1, 'loaded-disk': 1 };
+    'read-failed': 1, 'write-failed': 1, 'reauth-disk-newer': 1, 'loaded-disk': 1,
+    'saved-stale': 1, 'saved-as-stale': 1 };
 
   function fmtTime(ts) {
     if (!ts) return '未知时间';

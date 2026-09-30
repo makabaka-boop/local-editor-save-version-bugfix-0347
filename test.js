@@ -29,7 +29,7 @@ function createDrafts() {
 function AbortError() { const e = new Error('The user aborted a request.'); e.name = 'AbortError'; return e; }
 function NotAllowedError(msg) { const e = new Error(msg || 'Permission denied'); e.name = 'NotAllowedError'; return e; }
 
-/* ---- 可操纵的 Mock 文件句柄：撤权 / 外部改写 / 阻塞式迟到读取 ---- */
+/* ---- 可操纵的 Mock 文件句柄：撤权 / 外部改写 / 阻塞式迟到读取 / 阻塞式写入 ---- */
 class MockHandle {
   constructor(file) {
     this.file = file;
@@ -42,6 +42,8 @@ class MockHandle {
     return { name: this.file.name, text: async () => this.file.content };
   }
   async createWritable() {
+    // gate 代表写操作整体（含核心层“锁内重读 → 比对 → 写”）的挂起点
+    if (this.file.writeGate) await this.file.writeGate.promise;
     if (this.file.writeError) throw this.file.writeError;
     return {
       write: async (data) => {
@@ -73,6 +75,7 @@ function createMockFs() {
     let nextHandle = null;
     let nextSaveHandle = null;
     let pickAbort = false, saveAbort = false;
+    let prepareGate = null;       // {uid, gate}：写锁内“重读 → 比对”在该文件上挂起
     return {
       supported: () => true,
 
@@ -81,6 +84,7 @@ function createMockFs() {
       handle(f) { return new MockHandle(f); },
       setNextPick(f, { abort = false } = {}) { nextHandle = f; pickAbort = abort; },
       setNextSave(f, { abort = false } = {}) { nextSaveHandle = f; saveAbort = abort; },
+      setPrepareGate(f, g) { prepareGate = g ? { uid: f.uid, gate: g } : null; },
 
       async open() {
         if (pickAbort) { pickAbort = false; throw AbortError(); }
@@ -93,6 +97,7 @@ function createMockFs() {
         return new MockHandle(f);
       },
       async read(handle) {
+        if (prepareGate && prepareGate.uid === handle.file.uid) await prepareGate.gate.promise;
         if (handle.file.readGate) await handle.file.readGate.promise;
         return handle.file.content;
       },
@@ -508,4 +513,190 @@ test('11. 本地未关联文件的草稿：编辑即保留，恢复后可下载/
   const ok = await h2.ctrl.reauthorize(id);
   assert.equal(ok, false);
   assert.equal(h2.events.at(-1), 'reauth-unavailable');
+});
+
+test('12. 保存途中继续输入：旧快照写入后不得谎称全部已保存，新输入仍是未保存草稿', async () => {
+  const h = makeHarness();
+  await h.ctrl.init();
+  const f = await openFresh(h, 'race-edit.md', 'v1\n');
+  h.ctrl.setText('v2\n');
+  await h.tick();
+
+  const g = gate();
+  f.writeGate = g;                            // 写入挂起
+  const p = h.ctrl.save();
+  await h.tick(5);
+  assert.equal(h.ctrl.getState().saving, true);
+
+  h.ctrl.setText('v3（保存期间又输入）\n');
+  await h.tick(30);                           // 等防抖草稿落盘
+  assert.equal(h.drafts._rows.size, 1, '新输入必须已进入草稿备份');
+
+  g.resolve();                                // 迟到的写入结果返回
+  await p;
+  const st = h.ctrl.getState();
+  assert.equal(f.content, 'v2\n', '磁盘只收到保存发起时的快照');
+  assert.equal(st.status.code, 'saved-stale', '不得标记为“已保存”，应明确警示');
+  assert.equal(st.session.dirty, true, '后续编辑仍是未保存状态');
+  assert.equal(h.drafts._rows.size, 1, '草稿不得被删除');
+  assert.equal(h.drafts._rows.values().next().value.draftText, 'v3（保存期间又输入）\n');
+  // 基线已前进到磁盘上的 v2，便于下一次保存正确比对
+  assert.equal(st.session.baseDigest, await MDE.sha256('v2\n'));
+});
+
+test('13. 12 之后再次保存：基线为旧快照，无外部修改时新内容正常写回并清草稿', async () => {
+  const h = makeHarness();
+  await h.ctrl.init();
+  const f = await openFresh(h, 'race-edit2.md', 'v1\n');
+  h.ctrl.setText('v2\n');
+  await h.tick();
+  const g = gate();
+  f.writeGate = g;
+  const p = h.ctrl.save();
+  await h.tick(5);
+  h.ctrl.setText('v3\n');
+  await h.tick(30);
+  g.resolve();
+  await p;
+  assert.equal(h.ctrl.getState().status.code, 'saved-stale');
+
+  await h.ctrl.save();
+  const st = h.ctrl.getState();
+  assert.equal(st.status.code, 'saved');
+  assert.equal(f.content, 'v3\n');
+  assert.equal(st.session.dirty, false);
+  assert.equal(h.drafts._rows.size, 0);
+});
+
+test('14. 保存 A 途中切换到文档 B：A 的迟到结果不改 B 的状态，A 完整保存后草稿静默清理', async () => {
+  const h = makeHarness();
+  await h.ctrl.init();
+  const fa = await openFresh(h, 'a.md', 'A-v1\n');
+  h.ctrl.setText('A-v2\n');
+  await h.tick();
+  const idA = h.ctrl.getState().session.id;
+
+  const g = gate();
+  fa.writeGate = g;
+  const pA = h.ctrl.save();
+  await h.tick(5);
+  assert.equal(h.ctrl.getState().saving, true);
+
+  const fb = h.fs.createFile('b.md', 'B 内容\n');
+  h.adapter.setNextPick(fb);
+  await h.ctrl.openFile();                    // A 写入挂起期间切到 B
+  assert.equal(h.ctrl.getState().session.name, 'b.md');
+  assert.equal(h.ctrl.getState().status.code, 'opened');
+  assert.equal(h.ctrl.getState().saving, false);
+
+  h.ctrl.setText('B 内容（改了）\n');
+  await h.tick(30);
+
+  g.resolve();                                // A 的写入迟到
+  await pA;
+  await h.tick(5);
+  const st = h.ctrl.getState();
+  assert.equal(st.session.name, 'b.md');
+  assert.notEqual(st.status.code, 'saved', 'A 的结果不得把 B 标为已保存');
+  assert.notEqual(st.status.code, 'saved-stale');
+  assert.equal(st.session.dirty, true, 'B 的编辑不受 A 影响');
+  assert.equal(fa.content, 'A-v2\n', 'A 的快照正常落盘');
+  assert.equal(fb.content, 'B 内容\n', 'B 磁盘未被触碰');
+  const recA = await h.drafts.get(idA);
+  assert.equal(recA, undefined, 'A 已完整保存，其草稿应被静默删除');
+});
+
+test('15. 保存 A 途中切换文档且磁盘在锁内被外部修改：A 不被覆盖、草稿静默保留，绝不弹到 B', async () => {
+  const h = makeHarness();
+  await h.ctrl.init();
+  const fa = await openFresh(h, 'a2.md', 'A-v1\n');
+  h.ctrl.setText('A-v2\n');
+  await h.tick();
+  const idA = h.ctrl.getState().session.id;
+
+  const g = gate();
+  h.adapter.setPrepareGate(fa, g);              // 写临界区（锁内重读）挂起
+  const pA = h.ctrl.save();
+  await h.tick(5);
+
+  const fb = h.fs.createFile('b2.md', 'B\n');
+  h.adapter.setNextPick(fb);
+  fa.content = '外部在 A 保存途中改了 A\n';       // A 锁内 final check 会发现变化
+  await h.ctrl.openFile();
+
+  h.adapter.setPrepareGate(fa, null);
+  g.resolve();
+  await pA;
+  await h.tick(5);
+  const st = h.ctrl.getState();
+  assert.equal(st.session.name, 'b2.md');
+  assert.equal(st.conflict, null, 'A 的冲突不得弹到 B 的界面上');
+  assert.equal(fa.content, '外部在 A 保存途中改了 A\n', '检测到变化时 A 不得被覆盖写');
+  const recA = await h.drafts.get(idA);
+  assert.ok(recA && recA.draftText === 'A-v2\n', 'A 的草稿静默保留，等用户回来处理');
+});
+
+test('16. 同会话连点保存：读挂起时旧尝试作废；覆盖写入持锁期间再保存也不会并发互相覆盖', async () => {
+  const h = makeHarness();
+  await h.ctrl.init();
+  const f = await openFresh(h, 'double.md', 'v1\n');
+  h.ctrl.setText('编辑 A\n');
+  const gRead = gate();
+  f.readGate = gRead;
+
+  const pA = h.ctrl.save();
+  await h.tick(5);
+  f.content = '外部改写 v2\n';
+  h.ctrl.setText('编辑 A + 更多\n');
+  const pB = h.ctrl.save();                   // A 的读取仍挂着，B 使 A 的 token 作废
+  await h.tick(5);
+
+  gRead.resolve();
+  await pA;
+  assert.equal(f.writes.length, 0, 'A 迟到后不得写盘');
+  assert.equal(h.ctrl.getState().saving, true, 'B 继续');
+
+  await pB;
+  assert.equal(h.events.at(-1), 'conflict', 'B 读到外部改写 → 冲突（与用例 5 一致）');
+
+  // 用户选择覆盖：写锁保证“再读 → 写”期间不会被其他写插入
+  const gWrite = gate();
+  f.writeGate = gWrite;
+  const pOv = h.ctrl.resolveConflict('overwrite');
+  await h.tick(5);
+  // 覆盖写入挂起期间再次触发保存（连点 / Ctrl+S）：旧覆盖持锁写入，新保存锁内重比
+  const pC = h.ctrl.save();
+  await h.tick(5);
+  gWrite.resolve();
+  await pOv;
+  await pC;
+  assert.equal(f.content, '编辑 A + 更多\n');
+  assert.equal(h.ctrl.getState().session.dirty, false);
+});
+
+test('17. 另存为途中继续输入：新文件只含旧快照，新输入仍是未保存草稿并给出警示', async () => {
+  const h = makeHarness();
+  await h.ctrl.init();
+  await openFresh(h, 'old.md', 'v1\n');
+  h.ctrl.setText('v2\n');
+  await h.tick();
+
+  const f2 = h.fs.createFile('new.md', '');
+  const g = gate();
+  f2.writeGate = g;
+  h.adapter.setNextSave(f2);
+  const p = h.ctrl.saveAs();
+  await h.tick(5);
+  h.ctrl.setText('v3（另存期间输入）\n');
+  await h.tick(30);
+  g.resolve();
+  await p;
+
+  const st = h.ctrl.getState();
+  assert.equal(f2.content, 'v2\n');
+  assert.equal(st.status.code, 'saved-as-stale');
+  assert.equal(st.session.dirty, true);
+  assert.equal(st.session.name, 'new.md');
+  assert.equal(h.drafts._rows.size, 1, '后续输入的草稿保留（已关联到新文件）');
+  assert.equal(h.drafts._rows.values().next().value.draftText, 'v3（另存期间输入）\n');
 });
