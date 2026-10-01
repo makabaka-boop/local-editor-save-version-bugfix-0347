@@ -63,7 +63,7 @@ function createMockFs() {
   function createFile(name, content) {
     const f = {
       uid: 'f' + (++uidSeq), name, content,
-      permission: 'granted', writes: [], readGate: null,
+      permission: 'granted', writes: [], readGate: null, writeGate: null,
     };
     files.set(f.uid, f);
     return f;
@@ -97,6 +97,8 @@ function createMockFs() {
         return handle.file.content;
       },
       async write(handle, text) {
+        const g = handle.file.writeGate;      // 一次性写入门闩：只挂起下一次写入
+        if (g) { handle.file.writeGate = null; await g.promise; }
         const w = await handle.createWritable();
         await w.write(text);
         await w.close();
@@ -508,4 +510,94 @@ test('11. 本地未关联文件的草稿：编辑即保留，恢复后可下载/
   const ok = await h2.ctrl.reauthorize(id);
   assert.equal(ok, false);
   assert.equal(h2.events.at(-1), 'reauth-unavailable');
+});
+
+test('12. 保存期间继续输入：磁盘只含快照，dirty 与草稿保留，状态不得谎称已保存', async () => {
+  const h = makeHarness();
+  await h.ctrl.init();
+  const f = await openFresh(h);
+  h.ctrl.setText('v1 内容\n');
+  await h.tick();
+
+  const g = gate();
+  f.writeGate = g;                              // 写入将被挂起
+  const p = h.ctrl.save();
+  await h.tick(5);
+  assert.equal(h.ctrl.getState().saving, true);
+
+  h.ctrl.setText('v1 内容\n保存期间的新输入\n'); // 保存进行中，用户继续输入
+  g.resolve();
+  await p;
+
+  assert.equal(h.events.at(-1), 'saved-partial', '不得显示“已保存到原文件”');
+  assert.equal(f.content, 'v1 内容\n', '磁盘只收到保存时的快照');
+  const st = h.ctrl.getState();
+  assert.equal(st.session.dirty, true, '新输入必须仍是未保存状态');
+  assert.equal(st.session.baseDigest, await MDE.sha256('v1 内容\n'), '基线推进到已写回的版本');
+  assert.equal(h.drafts._rows.size, 1, '草稿必须保留（关页可恢复）');
+  const rec = h.drafts._rows.values().next().value;
+  assert.equal(rec.draftText, 'v1 内容\n保存期间的新输入\n');
+  assert.equal(rec.baseDigest, await MDE.sha256('v1 内容\n'), '草稿标注它所属的文件版本');
+
+  await h.ctrl.save();                          // 再次保存 → 全部写回并清理干净
+  assert.equal(h.events.at(-1), 'saved');
+  assert.equal(f.content, 'v1 内容\n保存期间的新输入\n');
+  assert.equal(h.ctrl.getState().session.dirty, false);
+  assert.equal(h.drafts._rows.size, 0);
+});
+
+test('13. 保存期间切换到另一份文档：迟到的保存结果不得改动新文档状态或删除旧草稿', async () => {
+  const h = makeHarness();
+  await h.ctrl.init();
+  const fa = await openFresh(h, 'a.md', 'A 原始内容\n');
+  h.ctrl.setText('A 的未保存编辑\n');
+  await h.tick();
+
+  const g = gate();
+  fa.readGate = g;                              // A 的保存被阻塞在读取阶段
+  const pA = h.ctrl.save();
+  await h.tick(5);
+  assert.equal(h.ctrl.getState().saving, true);
+
+  const fb = h.fs.createFile('b.md', 'B 的内容\n');   // 用户切换到另一份文档
+  h.adapter.setNextPick(fb);
+  await h.ctrl.openFile();
+  assert.equal(h.ctrl.getState().session.name, 'b.md');
+  assert.equal(h.ctrl.getState().status.code, 'opened');
+  assert.equal(h.drafts._rows.size, 1, '切换前 A 的草稿应已保留');
+
+  g.resolve();                                  // A 的保存迟到返回
+  await pA;
+  await h.tick(5);
+
+  assert.equal(fa.writes.length, 0, '迟到的保存不得再写入');
+  assert.equal(h.ctrl.getState().session.name, 'b.md');
+  assert.equal(h.ctrl.getState().status.code, 'opened', '新文档状态不得被旧保存结果改写');
+  assert.equal(h.ctrl.getState().saving, false);
+  assert.equal(h.drafts._rows.size, 1, 'A 的草稿不得被迟到结果删除');
+  assert.equal(h.drafts._rows.values().next().value.draftText, 'A 的未保存编辑\n');
+});
+
+test('14. 第二次保存取代第一次：两次写入不得交错，磁盘最终为最新文本', async () => {
+  const h = makeHarness();
+  await h.ctrl.init();
+  const f = await openFresh(h);
+  h.ctrl.setText('文本 A\n');
+
+  const g = gate();
+  f.writeGate = g;                              // 只拦住第一次写入（一次性门闩）
+  const pA = h.ctrl.save();
+  await h.tick(5);                              // A 的写入被挂起
+
+  h.ctrl.setText('文本 A + 追加\n');
+  const pB = h.ctrl.save();                     // B 取代 A（token 递增）
+  g.resolve();                                  // 放行 A 的迟到写入
+  await pA;
+  await pB;
+
+  assert.equal(h.events.at(-1), 'saved');
+  assert.equal(f.content, '文本 A + 追加\n', '磁盘必须是最新文本，不得回退到旧快照');
+  assert.deepEqual(f.writes, ['文本 A\n', '文本 A + 追加\n'], '旧写入先落定，新写入覆盖在后');
+  assert.equal(h.ctrl.getState().session.dirty, false);
+  assert.equal(h.drafts._rows.size, 0);
 });

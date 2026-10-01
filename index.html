@@ -271,6 +271,7 @@
     'saving': '正在写入文件…',
     'saved': '已保存到原文件',
     'saved-as': '已另存为新文件（原文件未改动）',
+    'saved-partial': '保存时的内容已写回；保存期间又有新输入，新修改尚未保存，草稿已保留',
     'downloaded': '已下载一份 Markdown 副本；未写回任何原文件，原文件保持不变',
     'download-failed': '下载副本失败，未保存草稿仍保留在本地',
     'conflict': '保存已暂停：磁盘文件在打开后被外部修改，请选择保留哪个版本',
@@ -409,8 +410,30 @@
     var saving = false;
     var conflict = null;   // {diskText,diskDigest,diskReadAt,expectedDigest}
     var gen = 0;           // 每次保存尝试递增；迟到的异步回沿用它识别并放弃
+    var writeChain = Promise.resolve();   // 写盘串行队列：旧写入落定后新写入才开始
+    var ownWrites = [];    // 本会话已发起写入的内容摘要：读取时据此认出“磁盘上是自己刚写的”
     var persistTimer = null;
     var listeners = [];
+
+    /* 切换文档/草稿时作废旧会话仍在进行的保存：
+       迟到的保存结果会因 token 失效被静默丢弃，不再改状态、不清草稿 */
+    function invalidatePendingSaves() { gen++; ownWrites = []; }
+
+    /* 所有写盘都经此串行排队：前一次写入落盘后下一次才开始，
+       避免被取代的旧写入晚于新写入落盘、把磁盘改回旧内容 */
+    function writeLocked(handle, text) {
+      var p = writeChain.then(function () { return adapter.write(handle, text); });
+      writeChain = p.then(function () {}, function () {});
+      return p;
+    }
+
+    /* 登记/识别本会话发起的写入。被取代的写入仍可能落盘，而它的完成回调
+       会被丢弃、基线来不及推进；之后读到相同内容时不应误报“外部修改” */
+    function noteOwnWrite(digest) {
+      ownWrites.push(digest);
+      if (ownWrites.length > 16) ownWrites.splice(0, ownWrites.length - 16);
+    }
+    function isOwnWrite(digest) { return ownWrites.indexOf(digest) >= 0; }
 
     function emit(code, extra) {
       status = { code: code, at: clock() };
@@ -471,6 +494,7 @@
     async function discardDraft(id) {
       await drafts['delete'](id);
       if (session && session.id === id) {
+        invalidatePendingSaves();
         session = blankLocal(); conflict = null; saving = false;
         emit('idle');
       } else {
@@ -499,6 +523,7 @@
     }
 
     async function openHandle(handle) {
+      invalidatePendingSaves();                  // 旧会话在途的保存结果一律作废
       await persistNow();
       conflict = null; saving = false;
       var text;
@@ -523,6 +548,7 @@
     }
 
     async function importText(name, text) {
+      invalidatePendingSaves();                  // 作废旧会话在途的保存
       await persistNow();
       conflict = null; saving = false;
       session = {
@@ -576,25 +602,36 @@
     }
 
     async function doWrite(s, text, token) {
-      try { await adapter.write(s.handle, text); }
+      if (token !== gen || session !== s) return false;   // 落盘前最后确认未被取代
+      var digest = await sha256(text);
+      if (token !== gen || session !== s) return false;
+      noteOwnWrite(digest);                               // 登记在途写入，供后续读取识别
+      try { await writeLocked(s.handle, text); }
       catch (e) {
-        if (token !== gen) return false;
+        if (token !== gen || session !== s) return false;
         saving = false;
         emit(isNotAllowed(e) ? 'permission-denied' : 'write-failed', { message: errMsg(e) });
         await persistNow();
         return false;
       }
-      if (token !== gen) return false;           // 迟到的写入结果：交由新尝试处理
-      var digest = await sha256(text);
+      if (token !== gen || session !== s) return false;   // 迟到的写入结果：交由新尝试处理
       s.baseDigest = digest;
       s.baseAt = clock();
-      s.dirty = false;
       s._diskDigest = digest;
       s._diskCheckedAt = clock();
       conflict = null;
       saving = false;
-      try { await drafts['delete'](s.id); } catch (e) {}
-      emit('saved', { digest: digest });
+      if (s.draftText === text) {
+        s.dirty = false;
+        try { await drafts['delete'](s.id); } catch (e) {}
+        emit('saved', { digest: digest });
+      } else {
+        /* 写入期间用户又输入了内容：磁盘只包含到 text 为止。
+           基线推进到已写回的版本，但 dirty 与草稿必须保留，状态不得谎称全部保存。 */
+        s.dirty = true;
+        await persistNow();
+        emit('saved-partial', { digest: digest });
+      }
       return true;
     }
 
@@ -609,16 +646,26 @@
         if (diskText === null) return;
         if (token !== gen) return;               // 迟到读取：直接丢弃，不弹窗也不写入
         var diskDigest = await sha256(diskText);
+        if (token !== gen) return;               // 摘要计算期间被更新的尝试取代
         if (diskDigest !== s.baseDigest) {
-          // 外部修改：暂停写入，保留草稿，等用户选择
-          conflict = {
-            diskText: diskText, diskDigest: diskDigest,
-            diskReadAt: clock(), expectedDigest: s.baseDigest
-          };
-          saving = false;
-          emit('conflict', { diskDigest: diskDigest });
-          await persistNow();
-          return;
+          if (isOwnWrite(diskDigest)) {
+            /* 磁盘上是自己此前发起、刚落盘的写入（该尝试被取代，基线没来得及
+               推进）：不是外部修改，把基线对齐到它，继续写当前草稿 */
+            s.baseDigest = diskDigest;
+            s.baseAt = clock();
+            s._diskDigest = diskDigest;
+            s._diskCheckedAt = clock();
+          } else {
+            // 外部修改：暂停写入，保留草稿，等用户选择
+            conflict = {
+              diskText: diskText, diskDigest: diskDigest,
+              diskReadAt: clock(), expectedDigest: s.baseDigest
+            };
+            saving = false;
+            emit('conflict', { diskDigest: diskDigest });
+            await persistNow();
+            return;
+          }
         }
         await doWrite(s, s.draftText, token);
       } catch (e) {
@@ -678,8 +725,9 @@
         if (diskText === null) return;
         if (token !== gen) return;
         var diskDigest = await sha256(diskText);
-        if (diskDigest !== c.diskDigest) {
-          // 对话框打开期间磁盘又被改了：刷新对比，要求再次确认
+        if (token !== gen) return;
+        if (diskDigest !== c.diskDigest && !isOwnWrite(diskDigest)) {
+          // 对话框打开期间磁盘又被改了（且不是自己的在途写入）：刷新对比，要求再次确认
           conflict = {
             diskText: diskText, diskDigest: diskDigest,
             diskReadAt: clock(), expectedDigest: s.baseDigest
@@ -715,7 +763,8 @@
         return;
       }
       if (token !== gen) return;
-      try { await adapter.write(handle, s.draftText); }
+      var text = s.draftText;                    // 快照：picker 期间用户可能继续输入
+      try { await writeLocked(handle, text); }
       catch (e) {
         if (token === gen) {
           saving = false;
@@ -726,24 +775,33 @@
       }
       if (token !== gen) return;
       var oldId = s.id;
-      var digest = await sha256(s.draftText);
+      var digest = await sha256(text);
+      if (token !== gen) return;
       s.kind = 'fs';
       s.handle = handle;
       s.name = handle.name || s.name;
       s.baseDigest = digest;
       s.baseAt = clock();
-      s.dirty = false;
       s._diskDigest = digest;
       s._diskCheckedAt = clock();
-      try { await drafts['delete'](oldId); } catch (e) {}
       saving = false;
-      emit('saved-as', { digest: digest, name: s.name });
+      if (s.draftText === text) {
+        s.dirty = false;
+        try { await drafts['delete'](oldId); } catch (e) {}
+        emit('saved-as', { digest: digest, name: s.name });
+      } else {
+        /* 写入期间又有新输入：新文件只包含到快照为止，dirty 与草稿保留 */
+        s.dirty = true;
+        await persistNow();
+        emit('saved-partial', { digest: digest, name: s.name });
+      }
     }
 
     /* ---------- 草稿恢复 / 重新授权 ---------- */
     async function restore(id) {
       var rec = await drafts.get(id);
       if (!rec) { emit('draft-missing'); return null; }
+      invalidatePendingSaves();                  // 作废旧会话在途的保存
       await persistNow();
       session = rec;
       conflict = null; saving = false;
@@ -868,12 +926,13 @@
   var WARN_CODES = { conflict: 1, 'conflict-open': 1, 'permission-denied': 1,
     'read-failed': 1, 'write-failed': 1, 'reauth-disk-newer': 1,
     'restored-disk-newer': 1, 'restored-need-auth': 1, 'save-cancelled': 1,
-    'download-failed': 1, 'reauthorized-read-failed': 1 };
+    'download-failed': 1, 'reauthorized-read-failed': 1, 'saved-partial': 1 };
   var ERR_CODES = { 'permission-denied': 1, 'read-failed': 1, 'write-failed': 1,
     'download-failed': 1, 'reauthorized-read-failed': 1 };
   var OK_CODES = { saved: 1, 'saved-as': 1, downloaded: 1, 'loaded-disk': 1, reauthorized: 1 };
   var TOAST_CODES = { saved: 1, 'saved-as': 1, downloaded: 1, 'permission-denied': 1,
-    'read-failed': 1, 'write-failed': 1, 'reauth-disk-newer': 1, 'loaded-disk': 1 };
+    'read-failed': 1, 'write-failed': 1, 'reauth-disk-newer': 1, 'loaded-disk': 1,
+    'saved-partial': 1 };
 
   function fmtTime(ts) {
     if (!ts) return '未知时间';
